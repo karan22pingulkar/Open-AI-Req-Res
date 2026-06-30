@@ -66,6 +66,7 @@ def single_prompt():
                 raise api_err
 
         # Log History
+
         db.history.insert_one({
             "prompt_id": "Education_Prompt",
             "user_input": user_input,
@@ -96,13 +97,17 @@ async def process_single_bulk_item(user_input, template_string):
         ai_text = f"[MOCK ASYNC RESPONSE] Comprehensive analysis for: '{user_input}'"
 
     # Log individual item history tracking into MongoDB
-    db.history.insert_one({
+
+    history_log = {
         "prompt_id": "Education_Prompt_Bulk",
         "user_input": user_input,
         "final_prompt": final_prompt,
         "ai_response": ai_text,
         "timestamp": datetime.utcnow()
-    })
+    }
+
+    check_print = db.history.insert_one(history_log)
+    print(f"Mongo successful:{check_print.inserted_id}")
     return ai_text
 
 
