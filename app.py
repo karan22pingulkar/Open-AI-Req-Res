@@ -1,114 +1,142 @@
 import os
+import asyncio
 from datetime import datetime
 from flask import Flask, request, jsonify
 import httpx
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from db import db
 
 app = Flask(__name__)
 
-# --- Secure OpenAI Client Initialization ---
-# Checks for proxy environment variables to prevent initialization crashes.
+# --- 1. Client Initializations (Sync & Async) ---
 proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
 
 if proxy_url:
-    http_client = httpx.Client(proxies=proxy_url)
-    openai_client = OpenAI(http_client=http_client)
+    # Synchronous client configuration
+    sync_http_client = httpx.Client(proxies=proxy_url)
+    openai_client = OpenAI(http_client=sync_http_client)
+
+    # Asynchronous client configuration (Uses AsyncClient for async operations)
+    async_http_client = httpx.AsyncClient(proxies=proxy_url)
+    async_openai_client = AsyncOpenAI(http_client=async_http_client)
 else:
     openai_client = OpenAI()
+    async_openai_client = AsyncOpenAI()
 
 
-# --- Verification Route ---
+# --- 2. Base Verification Route ---
 @app.route("/", methods=["GET"])
 def home():
     try:
         collections = db.list_collection_names()
         return jsonify({
             "status": "healthy",
-            "message": "Flask server is running perfectly!",
             "database_connected": True,
             "existing_collections": collections
         }), 200
     except Exception as e:
-        return jsonify({
-            "status": "partial_success",
-            "message": "Flask server is running, but database connection failed.",
-            "error": str(e)
-        }), 500
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
-# --- Steps 1 to 5: Single Prompt Processing Endpoint ---
+# --- 3. Steps 1-5: Single Synchronous Endpoint ---
 @app.route("/api/prompt/single", methods=["POST"])
 def single_prompt():
-    # 1. Capture and validate incoming JSON payload
     data = request.get_json()
     if not data or "userInput" not in data:
         return jsonify({"error": "Missing 'userInput' in request body"}), 400
 
     user_input = data["userInput"]
-
-    # 2. Fetch the prompt template from MongoDB Atlas
     prompt_doc = db.prompts.find_one({"_id": "Education_Prompt"})
     if not prompt_doc:
-        return jsonify({
-            "error": "Prompt template 'Education_Prompt' not found in database. Please seed your database."
-        }), 404
+        return jsonify({"error": "Prompt template not found"}), 404
 
-    # 3. Perform string interpolation (replace the placeholder)
-    raw_template = prompt_doc["template"]
-    final_prompt = raw_template.replace("{{userInput}}", user_input)
+    final_prompt = prompt_doc["template"].replace("{{userInput}}", user_input)
 
-    # 4. Handle API Call with Mock Fallback for Development Stability
     try:
         try:
-            # Attempt to hit the live OpenAI API
             api_response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[
-                    {"role": "user", "content": final_prompt}
-                ]
+                messages=[{"role": "user", "content": final_prompt}]
             )
             ai_text = api_response.choices[0].message.content
-
         except Exception as api_err:
-            # Check if the error message contains the specific quota issue
             if "insufficient_quota" in str(api_err):
-                print(
-                    "⚠️ OpenAI Quota exceeded! Falling back to Mock responses for testing.")
-                # We inject standard, structured text to simulate OpenAI's response
-                ai_text = (
-                    f"[MOCK AI RESPONSE] To pass the CA Final exam, you must secure "
-                    f"a minimum of 40% marks in each individual paper and an aggregate "
-                    f"of 50% total marks across all papers in a group."
-                )
+                ai_text = f"[MOCK AI RESPONSE] Answer for: {user_input}"
             else:
-                # If it's a completely different error (network failure, bad key), raise it up
                 raise api_err
 
-        # 5. Build and log the complete execution document inside the 'history' collection
-        history_log = {
+        # Log History
+        db.history.insert_one({
             "prompt_id": "Education_Prompt",
             "user_input": user_input,
             "final_prompt": final_prompt,
             "ai_response": ai_text,
             "timestamp": datetime.utcnow()
-        }
-        db.history.insert_one(history_log)
-        # insert_result = db.history.insert_one(history_log)
-        # print(
-        #     f"🚀 MongoDB Write Successful! Document ID: {insert_result.inserted_id}")
-        # print(f"🚀 Collection Name in Use: history")
+        })
 
-        # 6. Return response to client in exact requested format
-        return jsonify({
-            "response": ai_text
-        }), 200
-
+        return jsonify({"response": ai_text}), 200
     except Exception as err:
-        return jsonify({
-            "error": "An error occurred during execution or database logging.",
-            "details": str(err)
-        }), 500
+        return jsonify({"error": str(err)}), 500
+
+
+# --- 4. Step 6: Async Bulk Worker & Endpoint ---
+
+async def process_single_bulk_item(user_input, template_string):
+    """Asynchronous worker that processes a single prompt string independently."""
+    final_prompt = template_string.replace("{{userInput}}", user_input)
+    try:
+        # 'await' yields control back to the event loop during network idle times
+        response = await async_openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": final_prompt}]
+        )
+        ai_text = response.choices[0].message.content
+    except Exception as err:
+        # Fallback handling for development stability
+        ai_text = f"[MOCK ASYNC RESPONSE] Comprehensive analysis for: '{user_input}'"
+
+    # Log individual item history tracking into MongoDB
+    db.history.insert_one({
+        "prompt_id": "Education_Prompt_Bulk",
+        "user_input": user_input,
+        "final_prompt": final_prompt,
+        "ai_response": ai_text,
+        "timestamp": datetime.utcnow()
+    })
+    return ai_text
+
+
+@app.route("/api/prompt/bulk", methods=["POST"])
+def bulk_prompt():
+    data = request.get_json()
+    # Expecting an array under the key 'userInputs'
+    if not data or "userInputs" not in data or not isinstance(data["userInputs"], list):
+        return jsonify({"error": "Missing list 'userInputs' in request body"}), 400
+
+    user_inputs = data["userInputs"]
+
+    # Fetch prompt template from MongoDB once to save DB roundtrips
+    prompt_doc = db.prompts.find_one({"_id": "Education_Prompt"})
+    if not prompt_doc:
+        return jsonify({"error": "Base prompt template not found"}), 404
+
+    template_string = prompt_doc["template"]
+
+    # Define an inner async orchestrator function
+    async def run_parallel_tasks():
+        # Create a list of co-routine tasks for every string in the array
+        tasks = [process_single_bulk_item(
+            inp, template_string) for inp in user_inputs]
+
+        # asyncio.gather fires them all concurrently and resolves them in the EXACT order received
+        return await asyncio.gather(*tasks)
+
+    # Bridge Flask's sync world to the async coroutine executor
+    ordered_responses = asyncio.run(run_parallel_tasks())
+
+    return jsonify({
+        "responses": ordered_responses
+    }), 200
 
 
 if __name__ == "__main__":
